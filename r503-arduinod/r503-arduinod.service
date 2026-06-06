@@ -1,0 +1,16 @@
+[Unit]
+Description=R503 Arduino fingerprint scanner bridge daemon
+After=dev-ttyUSB0.device
+BindsTo=dev-ttyUSB0.device
+StartLimitIntervalSec=30
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStart=r503-arduinod
+Restart=on-failure
+RestartSec=2
+User=root
+
+[Install]
+WantedBy=multi-user.target

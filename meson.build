@@ -47,7 +47,7 @@ install_data(
 )
 
 install_data(
-  'r503-arduinod/fprintd.service.d/r503-arduino.conf',
+  'fprintd.service.d/r503-arduino.conf',
   install_dir: systemd_dep.get_variable(pkgconfig: 'systemdsystemunitdir') / 'fprintd.service.d',
   install_mode: 'rw-r--r--',
 )

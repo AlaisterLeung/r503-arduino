@@ -4,7 +4,7 @@ The goal of this project is to create a DIY fingerprint scanner for Linux with `
 
 ## Hardware prerequisites
 
-- R503 fingerprint scanner (tested on V1.3; may work for R502 or other models)
+- R503 fingerprint scanner (tested on V1.3)
 - Arduino board (tested on Nano v3)
 - Proper connection between R503 and Arduino (see [references](#References) below)
 - USB serial connection between Arduino and PC
@@ -17,7 +17,7 @@ Upload `r503_bridge.ino` to your Arduino board.
 
 ### Bridge daemon and libfprint-tod driver
 
-> Note: I've tried to adopt an approach that doesn't require a daemon or Unix socket. Unfortunately, since the Arduino Nano board (I was testing with) **resets on every serial connection and disconnection** ([Arduino docs](https://support.arduino.cc/hc/en-us/articles/4839084114460-If-your-board-runs-the-sketch-twice)), every operation adds a significant (~3-second) delay for waiting it to finish booting and be in READY state which is impractical for daily usage. The daemon is a software fix which keeps the serial connection open. **Beware that my driver assumes the daemon is installed and running.** Thus, even though your board doesn't have the reset issue, you still need to install the daemon in order to use my driver. You can of course write one yourself that doesn't depend on a daemon.
+> Note: I've tried to adopt an approach that doesn't require a daemon or Unix socket. Unfortunately, since my Arduino Nano board **resets on every serial connection and disconnection** ([Arduino docs](https://support.arduino.cc/hc/en-us/articles/4839084114460-If-your-board-runs-the-sketch-twice)), every operation adds a significant (~3-second) delay for waiting it to finish booting and be in READY state which is impractical for daily usage. The daemon is a software fix which keeps the serial connection open. **Beware that my driver assumes the daemon is installed and running.** Thus, even though your board doesn't have the reset issue, you still need to install the daemon in order to use my driver. You can of course write one yourself that doesn't depend on a daemon.
 
 If you are on Arch-based distro, install `libfprint-tod` from [AUR](https://aur.archlinux.org/packages/libfprint-tod). Verify the installation afterwards:
 
@@ -57,9 +57,9 @@ fprintd-list $USER
 | `INFO`        | `OK:CAPACITY,<n>,USED,<n>,SEC_LEVEL,<n>,BAUD_RATE,<n>`                                                           | Query sensor parameters                           |
 | `ENROLL`      | `OK:PLACE_FINGER,STEP,1,ID,<id>` → `OK:REMOVE_FINGER` → `OK:PLACE_FINGER,STEP,2,ID,<id>` → `OK:ENROLLED,ID,<id>` | Enroll fingerprint into first empty slot          |
 | `VERIFY`      | `OK:PLACE_FINGER` → `OK:VERIFIED,ID,<id>,CONFIDENCE,<n>`                                                         | Verify fingerprint against stored templates       |
+| `LIST`        | `OK:LIST,<id1>,<id2>,...`                                                                                        | List all occupied template IDs                    |
 | `DELETE:<id>` | `OK:DELETED,ID,<id>`                                                                                             | Delete a specific template                        |
 | `CLEAR`       | `OK:CLEARED`                                                                                                     | Delete all templates                              |
-| `LIST`        | `OK:LIST,<id1>,<id2>,...`                                                                                        | List all occupied template IDs                    |
 | `CANCEL`      | _(no output)_                                                                                                    | Cancel the current `ENROLL` or `VERIFY` operation |
 
 ### fprintd
@@ -84,7 +84,7 @@ sudo dmesg | grep ttyUSB
 ### Debug daemon socket
 
 ```bash
-sudo ./build/r503-arduinod
+sudo r503-arduinod
 socat - UNIX-CONNECT:/run/r503-arduinod.sock
 ```
 
@@ -103,7 +103,7 @@ sudo rm $(pkg-config --variable=systemdsystemunitdir systemd)/fprintd.service.d/
 
 sudo systemctl stop r503-arduinod
 sudo rm $(pkg-config --variable=systemdsystemunitdir systemd)/r503-arduinod.service
-sudo rm -f /usr/bin/r503-arduinod
+sudo rm -f /usr/bin/r503-arduinod /usr/local/bin/r503-arduinod
 sudo systemctl daemon-reload
 sudo systemctl restart fprintd
 ```

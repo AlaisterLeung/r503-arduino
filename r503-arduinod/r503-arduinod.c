@@ -1,3 +1,4 @@
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -10,6 +11,7 @@
 #include <sys/stat.h>
 #include <sys/un.h>
 #include <termios.h>
+#include <time.h>
 #include <unistd.h>
 
 #ifndef R503_ARDUINOD_SERIAL
@@ -20,7 +22,40 @@
 #define R503_ARDUINOD_SOCKET "/run/r503-arduinod.sock"
 #endif
 
+#define IO_BUF_SIZE 4096
+#define CLIENT_READ_CHUNK 1024
+#define HEALTHCHECK_INITIAL_DELAY_MS 10000
+#define HEALTHCHECK_INTERVAL_MS 5000
+#define HEALTHCHECK_TIMEOUT_MS 3000
+#define SERIAL_RETRY_DELAY_MS 1000
+
 static volatile sig_atomic_t g_quit = 0;
+
+typedef enum {
+  CMD_NONE = 0,
+  CMD_PING,
+  CMD_INFO,
+  CMD_ENROLL,
+  CMD_VERIFY,
+  CMD_LIST,
+  CMD_DELETE,
+  CMD_CLEAR,
+} PendingCmd;
+
+typedef struct {
+  const char *serial_path;
+  int serial_fd;
+  int client_fd;
+  char serial_buf[IO_BUF_SIZE];
+  size_t serial_len;
+  char client_buf[IO_BUF_SIZE];
+  size_t client_len;
+  PendingCmd pending_cmd;
+  bool healthcheck_pending;
+  long long next_healthcheck_ms;
+  long long healthcheck_deadline_ms;
+  long long serial_retry_ms;
+} BridgeState;
 
 static void print_help(const char *prog) {
   printf("Usage: %s [--serial PATH] [--socket PATH] [--help]\n", prog);
@@ -34,6 +69,70 @@ static void print_help(const char *prog) {
 static void handle_signal(int sig) {
   (void)sig;
   g_quit = 1;
+}
+
+static long long now_ms(void) {
+  struct timespec ts;
+  if (clock_gettime(CLOCK_MONOTONIC, &ts) < 0)
+    return 0;
+  return (long long)ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL;
+}
+
+static void trim_eol(char *line) {
+  if (!line)
+    return;
+
+  size_t len = strlen(line);
+  while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r'))
+    line[--len] = '\0';
+}
+
+static void uppercase_in_place(char *line) {
+  if (!line)
+    return;
+
+  for (; *line != '\0'; line++)
+    *line = (char)toupper((unsigned char)*line);
+}
+
+static int write_all(int fd, const char *buf, size_t len) {
+  size_t written = 0;
+  while (written < len) {
+    ssize_t n = write(fd, buf + written, len - written);
+    if (n < 0) {
+      if (errno == EINTR) {
+        if (g_quit)
+          return -1;
+        continue;
+      }
+      return -1;
+    }
+    if (n == 0)
+      return -1;
+    written += (size_t)n;
+  }
+  return 0;
+}
+
+static bool extract_line(char *buf, size_t *len, char *out, size_t out_cap,
+                         size_t *out_len) {
+  char *nl = memchr(buf, '\n', *len);
+  if (!nl)
+    return false;
+
+  size_t line_len = (size_t)(nl - buf) + 1;
+  if (line_len >= out_cap)
+    return false;
+
+  memcpy(out, buf, line_len);
+  out[line_len] = '\0';
+
+  size_t remaining = *len - line_len;
+  if (remaining > 0)
+    memmove(buf, buf + line_len, remaining);
+  *len = remaining;
+  *out_len = line_len;
+  return true;
 }
 
 static int setup_serial(const char *path) {
@@ -113,90 +212,343 @@ static int setup_socket(const char *path) {
   return fd;
 }
 
-static int write_all(int fd, const char *buf, size_t len) {
-  size_t written = 0;
-  while (written < len) {
-    ssize_t n = write(fd, buf + written, len - written);
-    if (n < 0) {
-      if (errno == EINTR) {
-        if (g_quit)
-          return -1;
-        continue;
-      }
-      return -1;
-    }
-    if (n == 0)
-      return -1;
-    written += (size_t)n;
+static void close_client(BridgeState *st) {
+  if (st->client_fd >= 0)
+    close(st->client_fd);
+  st->client_fd = -1;
+  st->client_len = 0;
+}
+
+static void close_serial(BridgeState *st) {
+  if (st->serial_fd >= 0)
+    close(st->serial_fd);
+  st->serial_fd = -1;
+  st->serial_len = 0;
+  st->healthcheck_pending = false;
+  st->healthcheck_deadline_ms = 0;
+}
+
+static void reset_healthcheck(BridgeState *st, long long now) {
+  st->healthcheck_pending = false;
+  st->next_healthcheck_ms = now + HEALTHCHECK_INITIAL_DELAY_MS;
+  st->healthcheck_deadline_ms = 0;
+}
+
+static void recover_serial(BridgeState *st, long long now) {
+  close_serial(st);
+  st->pending_cmd = CMD_NONE;
+  st->serial_retry_ms = now + SERIAL_RETRY_DELAY_MS;
+  close_client(st);
+}
+
+static PendingCmd classify_command(const char *line) {
+  if (strcmp(line, "PING") == 0)
+    return CMD_PING;
+  if (strcmp(line, "INFO") == 0)
+    return CMD_INFO;
+  if (strcmp(line, "ENROLL") == 0)
+    return CMD_ENROLL;
+  if (strcmp(line, "VERIFY") == 0)
+    return CMD_VERIFY;
+  if (strcmp(line, "LIST") == 0)
+    return CMD_LIST;
+  if (strncmp(line, "DELETE:", 7) == 0)
+    return CMD_DELETE;
+  if (strcmp(line, "CLEAR") == 0)
+    return CMD_CLEAR;
+  return CMD_NONE;
+}
+
+static bool pending_cmd_is_terminal(PendingCmd cmd, const char *line) {
+  if (strncmp(line, "ERR:", 4) == 0)
+    return true;
+
+  switch (cmd) {
+  case CMD_PING:
+    return strcmp(line, "OK") == 0;
+  case CMD_INFO:
+    return strncmp(line, "OK:CAPACITY,", 12) == 0;
+  case CMD_ENROLL:
+    return strncmp(line, "OK:ENROLLED,", 12) == 0;
+  case CMD_VERIFY:
+    return strncmp(line, "OK:VERIFIED,", 12) == 0 ||
+           strcmp(line, "ERR:NO_MATCH") == 0;
+  case CMD_LIST:
+    return strncmp(line, "OK:LIST", 7) == 0;
+  case CMD_DELETE:
+    return strncmp(line, "OK:DELETED,", 11) == 0;
+  case CMD_CLEAR:
+    return strcmp(line, "OK:CLEARED") == 0;
+  case CMD_NONE:
+  default:
+    return false;
   }
+}
+
+static int process_client_line(BridgeState *st, const char *raw, size_t raw_len,
+                               long long now) {
+  char line[IO_BUF_SIZE];
+  if (raw_len >= sizeof(line))
+    return -1;
+
+  memcpy(line, raw, raw_len);
+  line[raw_len] = '\0';
+  trim_eol(line);
+  uppercase_in_place(line);
+
+  if (st->serial_fd < 0)
+    return -1;
+
+  PendingCmd cmd = classify_command(line);
+  if (cmd != CMD_NONE)
+    st->pending_cmd = cmd;
+
+  if (write_all(st->serial_fd, raw, raw_len) < 0) {
+    recover_serial(st, now);
+    return -1;
+  }
+
   return 0;
 }
 
-static int forward(int from_fd, int to_fd) {
-  char buf[4096];
-  ssize_t n = read(from_fd, buf, sizeof(buf));
+static int process_serial_line(BridgeState *st, const char *raw, size_t raw_len,
+                               long long now) {
+  char line[IO_BUF_SIZE];
+  if (raw_len >= sizeof(line))
+    return -1;
+
+  memcpy(line, raw, raw_len);
+  line[raw_len] = '\0';
+  trim_eol(line);
+
+  if (st->healthcheck_pending) {
+    if (strcmp(line, "OK") == 0) {
+      st->healthcheck_pending = false;
+      st->next_healthcheck_ms = now + HEALTHCHECK_INTERVAL_MS;
+      return 0;
+    }
+
+    fprintf(stderr, "healthcheck failed: %s\n", line);
+    recover_serial(st, now);
+    return -1;
+  }
+
+  if (st->client_fd >= 0) {
+    if (write_all(st->client_fd, raw, raw_len) < 0) {
+      close_client(st);
+      return -1;
+    }
+  }
+
+  if (st->pending_cmd != CMD_NONE &&
+      pending_cmd_is_terminal(st->pending_cmd, line)) {
+    st->pending_cmd = CMD_NONE;
+  }
+
+  return 0;
+}
+
+static int drain_fd(BridgeState *st, int fd, bool from_client, long long now) {
+  char chunk[CLIENT_READ_CHUNK];
+  char line[IO_BUF_SIZE];
+  char *buf = from_client ? st->client_buf : st->serial_buf;
+  size_t *len = from_client ? &st->client_len : &st->serial_len;
+
+  ssize_t n = read(fd, chunk, sizeof(chunk));
   if (n < 0) {
     if (errno == EINTR)
       return 0;
     return -1;
   }
   if (n == 0)
+    return 1;
+
+  if (*len + (size_t)n > IO_BUF_SIZE)
     return -1;
-  return write_all(to_fd, buf, (size_t)n);
+
+  memcpy(buf + *len, chunk, (size_t)n);
+  *len += (size_t)n;
+
+  size_t line_len = 0;
+  while (extract_line(buf, len, line, sizeof(line), &line_len)) {
+    int rc = from_client ? process_client_line(st, line, line_len, now)
+                         : process_serial_line(st, line, line_len, now);
+    if (rc < 0)
+      return -1;
+  }
+
+  return 0;
 }
 
-static void bridge(int serial_fd, int listen_fd, const char *socket_path) {
-  (void)socket_path;
+static void init_bridge_state(BridgeState *st, const char *serial_path) {
+  *st = (BridgeState){
+      .serial_path = serial_path,
+      .serial_fd = -1,
+      .client_fd = -1,
+      .serial_len = 0,
+      .client_len = 0,
+      .pending_cmd = CMD_NONE,
+      .healthcheck_pending = false,
+      .next_healthcheck_ms = 0,
+      .healthcheck_deadline_ms = 0,
+      .serial_retry_ms = 0,
+  };
+}
+
+static int accept_client(int listen_fd) {
+  struct sockaddr_un client_addr;
+  socklen_t client_addr_len = sizeof(client_addr);
+  return accept(listen_fd, (struct sockaddr *)&client_addr, &client_addr_len);
+}
+
+static void update_serial_connection(BridgeState *st, long long now) {
+  if (st->serial_fd >= 0 || now < st->serial_retry_ms)
+    return;
+
+  st->serial_fd = setup_serial(st->serial_path);
+  if (st->serial_fd >= 0)
+    reset_healthcheck(st, now);
+  else
+    st->serial_retry_ms = now + SERIAL_RETRY_DELAY_MS;
+}
+
+static bool maybe_send_healthcheck(BridgeState *st, long long now) {
+  if (st->serial_fd < 0 || st->healthcheck_pending ||
+      st->pending_cmd != CMD_NONE || st->client_len != 0 ||
+      st->serial_len != 0 || now < st->next_healthcheck_ms)
+    return false;
+
+  if (write_all(st->serial_fd, "PING\n", 5) < 0) {
+    recover_serial(st, now);
+    return false;
+  }
+
+  st->healthcheck_pending = true;
+  st->healthcheck_deadline_ms = now + HEALTHCHECK_TIMEOUT_MS;
+  return true;
+}
+
+static int compute_poll_timeout(const BridgeState *st, long long now) {
+  long long next_ms;
+
+  if (st->serial_fd < 0)
+    next_ms = st->serial_retry_ms;
+  else if (st->healthcheck_pending)
+    next_ms = st->healthcheck_deadline_ms;
+  else
+    next_ms = st->next_healthcheck_ms;
+
+  if (next_ms <= now)
+    return 0;
+  return (int)(next_ms - now);
+}
+
+static void bridge(const char *serial_path, int listen_fd) {
+  BridgeState st;
+  init_bridge_state(&st, serial_path);
 
   while (!g_quit) {
-    struct sockaddr_un client_addr;
-    socklen_t client_addr_len = sizeof(client_addr);
-    int client_fd =
-        accept(listen_fd, (struct sockaddr *)&client_addr, &client_addr_len);
-    if (client_fd < 0) {
-      if (errno == EINTR) {
-        if (g_quit)
-          break;
+    long long now = now_ms();
+    update_serial_connection(&st, now);
+    maybe_send_healthcheck(&st, now);
+
+    struct pollfd fds[3];
+    nfds_t nfds = 0;
+    int listen_idx = -1;
+    int serial_idx = -1;
+    int client_idx = -1;
+
+    fds[nfds].fd = listen_fd;
+    fds[nfds].events = POLLIN;
+    fds[nfds].revents = 0;
+    listen_idx = (int)nfds;
+    nfds++;
+
+    if (st.serial_fd >= 0) {
+      fds[nfds].fd = st.serial_fd;
+      fds[nfds].events = POLLIN;
+      fds[nfds].revents = 0;
+      serial_idx = (int)nfds;
+      nfds++;
+    }
+
+    if (st.client_fd >= 0) {
+      fds[nfds].fd = st.client_fd;
+      fds[nfds].events = POLLIN;
+      fds[nfds].revents = 0;
+      client_idx = (int)nfds;
+      nfds++;
+    }
+
+    int timeout = compute_poll_timeout(&st, now);
+    int ret = poll(fds, nfds, timeout);
+    if (ret < 0) {
+      if (errno == EINTR)
         continue;
-      }
-      perror("accept");
+      perror("poll");
       break;
     }
 
-    while (!g_quit) {
-      struct pollfd fds[2] = {
-          {serial_fd, POLLIN, 0},
-          {client_fd, POLLIN, 0},
-      };
+    now = now_ms();
 
-      int ret = poll(fds, 2, -1);
-      if (ret < 0) {
-        if (errno == EINTR) {
-          if (g_quit)
-            break;
-          continue;
-        }
-        perror("poll");
-        break;
-      }
-
-      if (fds[0].revents & POLLIN) {
-        if (forward(serial_fd, client_fd) < 0)
-          break;
-      }
-      if (fds[0].revents & (POLLERR | POLLHUP | POLLNVAL))
-        break;
-
-      if (fds[1].revents & POLLIN) {
-        if (forward(client_fd, serial_fd) < 0)
-          break;
-      }
-      if (fds[1].revents & (POLLERR | POLLHUP | POLLNVAL))
-        break;
+    if (st.healthcheck_pending && now >= st.healthcheck_deadline_ms) {
+      fprintf(stderr, "healthcheck timeout\n");
+      recover_serial(&st, now);
+      continue;
     }
 
-    close(client_fd);
+    if (listen_idx >= 0 && (fds[listen_idx].revents & POLLIN)) {
+      int client_fd = accept_client(listen_fd);
+      if (client_fd < 0) {
+        if (errno != EINTR) {
+          perror("accept");
+          break;
+        }
+      } else {
+        close_client(&st);
+        st.client_fd = client_fd;
+      }
+    }
+
+    if (serial_idx >= 0 &&
+        (fds[serial_idx].revents & (POLLERR | POLLHUP | POLLNVAL))) {
+      recover_serial(&st, now);
+      continue;
+    }
+
+    if (client_idx >= 0 &&
+        (fds[client_idx].revents & (POLLERR | POLLHUP | POLLNVAL))) {
+      close_client(&st);
+      continue;
+    }
+
+    if (serial_idx >= 0 && (fds[serial_idx].revents & POLLIN)) {
+      int rc = drain_fd(&st, st.serial_fd, false, now);
+      if (rc < 0) {
+        recover_serial(&st, now);
+        continue;
+      }
+      if (rc > 0) {
+        recover_serial(&st, now);
+        continue;
+      }
+    }
+
+    if (client_idx >= 0 && (fds[client_idx].revents & POLLIN)) {
+      int rc = drain_fd(&st, st.client_fd, true, now);
+      if (rc < 0) {
+        close_client(&st);
+        continue;
+      }
+      if (rc > 0) {
+        close_client(&st);
+        continue;
+      }
+    }
   }
+
+  close_client(&st);
+  close_serial(&st);
 }
 
 int main(int argc, char **argv) {
@@ -233,20 +585,13 @@ int main(int argc, char **argv) {
   sigaction(SIGINT, &sa, NULL);
   sigaction(SIGTERM, &sa, NULL);
 
-  int serial_fd = setup_serial(serial_path);
-  if (serial_fd < 0)
-    return EXIT_FAILURE;
-
   int listen_fd = setup_socket(socket_path);
-  if (listen_fd < 0) {
-    close(serial_fd);
+  if (listen_fd < 0)
     return EXIT_FAILURE;
-  }
 
-  bridge(serial_fd, listen_fd, socket_path);
+  bridge(serial_path, listen_fd);
 
   close(listen_fd);
-  close(serial_fd);
   unlink(socket_path);
 
   return EXIT_SUCCESS;

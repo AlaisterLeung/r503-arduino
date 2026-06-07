@@ -1,7 +1,7 @@
 project(
   'libfprint-2-tod1-r503-arduino',
   ['c'],
-  version: '1.0.0',
+  version: '1.1.0',
   license: 'MIT',
   default_options: [
     'buildtype=debugoptimized',
@@ -20,8 +20,8 @@ libsystemd_dep = dependency('libsystemd')
 shared_module(
   'fprint-2-tod1-r503-arduino',
   sources: [
-    'tod-r503-arduino.c',
-    'tod-r503-arduino.h',
+    'tod-r503-arduino/tod-r503-arduino.c',
+    'tod-r503-arduino/tod-r503-arduino.h',
   ],
   dependencies: libfprint_tod_dep,
   install: true,

@@ -24,10 +24,11 @@
 
 #define IO_BUF_SIZE 4096
 #define CLIENT_READ_CHUNK 1024
-#define HEALTHCHECK_INITIAL_DELAY_MS 10000
+#define HEALTHCHECK_INITIAL_DELAY_MS 15000
 #define HEALTHCHECK_INTERVAL_MS 5000
-#define HEALTHCHECK_TIMEOUT_MS 3000
-#define SERIAL_RETRY_DELAY_MS 1000
+#define GENERIC_TIMEOUT_MS 1000
+#define ENROLL_TIMEOUT_MS 24000
+#define VERIFY_TIMEOUT_MS 12000
 
 static volatile sig_atomic_t g_quit = 0;
 
@@ -54,7 +55,7 @@ typedef struct {
   bool healthcheck_pending;
   long long next_healthcheck_ms;
   long long healthcheck_deadline_ms;
-  long long serial_retry_ms;
+  long long command_deadline_ms;
 } BridgeState;
 
 static void print_help(const char *prog) {
@@ -151,6 +152,7 @@ static int setup_serial(const char *path) {
 
   cfmakeraw(&tty);
   tty.c_cflag |= (CLOCAL | CREAD);
+  tty.c_cflag &= ~HUPCL;
   tty.c_cc[VMIN] = 1;
   tty.c_cc[VTIME] = 0;
 
@@ -226,19 +228,13 @@ static void close_serial(BridgeState *st) {
   st->serial_len = 0;
   st->healthcheck_pending = false;
   st->healthcheck_deadline_ms = 0;
+  st->command_deadline_ms = 0;
 }
 
 static void reset_healthcheck(BridgeState *st, long long now) {
   st->healthcheck_pending = false;
   st->next_healthcheck_ms = now + HEALTHCHECK_INITIAL_DELAY_MS;
   st->healthcheck_deadline_ms = 0;
-}
-
-static void recover_serial(BridgeState *st, long long now) {
-  close_serial(st);
-  st->pending_cmd = CMD_NONE;
-  st->serial_retry_ms = now + SERIAL_RETRY_DELAY_MS;
-  close_client(st);
 }
 
 static PendingCmd classify_command(const char *line) {
@@ -257,6 +253,17 @@ static PendingCmd classify_command(const char *line) {
   if (strcmp(line, "CLEAR") == 0)
     return CMD_CLEAR;
   return CMD_NONE;
+}
+
+static long long command_timeout_ms(PendingCmd cmd) {
+  switch (cmd) {
+  case CMD_ENROLL:
+    return ENROLL_TIMEOUT_MS;
+  case CMD_VERIFY:
+    return VERIFY_TIMEOUT_MS;
+  default:
+    return GENERIC_TIMEOUT_MS;
+  }
 }
 
 static bool pending_cmd_is_terminal(PendingCmd cmd, const char *line) {
@@ -300,11 +307,13 @@ static int process_client_line(BridgeState *st, const char *raw, size_t raw_len,
     return -1;
 
   PendingCmd cmd = classify_command(line);
-  if (cmd != CMD_NONE)
+  if (cmd != CMD_NONE) {
     st->pending_cmd = cmd;
+    st->command_deadline_ms = now + command_timeout_ms(cmd);
+  }
 
   if (write_all(st->serial_fd, raw, raw_len) < 0) {
-    recover_serial(st, now);
+    perror("write serial");
     return -1;
   }
 
@@ -328,21 +337,19 @@ static int process_serial_line(BridgeState *st, const char *raw, size_t raw_len,
       return 0;
     }
 
-    fprintf(stderr, "healthcheck failed: %s\n", line);
-    recover_serial(st, now);
+    fprintf(stderr, "unexpected healthcheck response: %s\n", line);
     return -1;
   }
 
   if (st->client_fd >= 0) {
-    if (write_all(st->client_fd, raw, raw_len) < 0) {
-      close_client(st);
+    if (write_all(st->client_fd, raw, raw_len) < 0)
       return -1;
-    }
   }
 
   if (st->pending_cmd != CMD_NONE &&
       pending_cmd_is_terminal(st->pending_cmd, line)) {
     st->pending_cmd = CMD_NONE;
+    st->command_deadline_ms = 0;
   }
 
   return 0;
@@ -391,7 +398,7 @@ static void init_bridge_state(BridgeState *st, const char *serial_path) {
       .healthcheck_pending = false,
       .next_healthcheck_ms = 0,
       .healthcheck_deadline_ms = 0,
-      .serial_retry_ms = 0,
+      .command_deadline_ms = 0,
   };
 }
 
@@ -402,39 +409,40 @@ static int accept_client(int listen_fd) {
 }
 
 static void update_serial_connection(BridgeState *st, long long now) {
-  if (st->serial_fd >= 0 || now < st->serial_retry_ms)
+  (void)now;
+  if (st->serial_fd >= 0)
     return;
 
   st->serial_fd = setup_serial(st->serial_path);
   if (st->serial_fd >= 0)
     reset_healthcheck(st, now);
-  else
-    st->serial_retry_ms = now + SERIAL_RETRY_DELAY_MS;
 }
 
-static bool maybe_send_healthcheck(BridgeState *st, long long now) {
+static int send_healthcheck(BridgeState *st, long long now) {
   if (st->serial_fd < 0 || st->healthcheck_pending ||
       st->pending_cmd != CMD_NONE || st->client_len != 0 ||
       st->serial_len != 0 || now < st->next_healthcheck_ms)
-    return false;
+    return 0;
 
   if (write_all(st->serial_fd, "PING\n", 5) < 0) {
-    recover_serial(st, now);
-    return false;
+    perror("write serial");
+    return -1;
   }
 
   st->healthcheck_pending = true;
-  st->healthcheck_deadline_ms = now + HEALTHCHECK_TIMEOUT_MS;
-  return true;
+  st->healthcheck_deadline_ms = now + GENERIC_TIMEOUT_MS;
+  return 1;
 }
 
 static int compute_poll_timeout(const BridgeState *st, long long now) {
   long long next_ms;
 
   if (st->serial_fd < 0)
-    next_ms = st->serial_retry_ms;
+    return 0;
   else if (st->healthcheck_pending)
     next_ms = st->healthcheck_deadline_ms;
+  else if (st->pending_cmd != CMD_NONE)
+    next_ms = st->command_deadline_ms;
   else
     next_ms = st->next_healthcheck_ms;
 
@@ -443,14 +451,21 @@ static int compute_poll_timeout(const BridgeState *st, long long now) {
   return (int)(next_ms - now);
 }
 
-static void bridge(const char *serial_path, int listen_fd) {
+static int exit_bridge(BridgeState *st) {
+  close_client(st);
+  close_serial(st);
+  return 1;
+}
+
+static int bridge(const char *serial_path, int listen_fd) {
   BridgeState st;
   init_bridge_state(&st, serial_path);
 
   while (!g_quit) {
     long long now = now_ms();
     update_serial_connection(&st, now);
-    maybe_send_healthcheck(&st, now);
+    if (send_healthcheck(&st, now) < 0)
+      return exit_bridge(&st);
 
     struct pollfd fds[3];
     nfds_t nfds = 0;
@@ -493,8 +508,12 @@ static void bridge(const char *serial_path, int listen_fd) {
 
     if (st.healthcheck_pending && now >= st.healthcheck_deadline_ms) {
       fprintf(stderr, "healthcheck timeout\n");
-      recover_serial(&st, now);
-      continue;
+      return exit_bridge(&st);
+    }
+
+    if (st.pending_cmd != CMD_NONE && now >= st.command_deadline_ms) {
+      fprintf(stderr, "command timeout (cmd=%d)\n", st.pending_cmd);
+      return exit_bridge(&st);
     }
 
     if (listen_idx >= 0 && (fds[listen_idx].revents & POLLIN)) {
@@ -512,8 +531,7 @@ static void bridge(const char *serial_path, int listen_fd) {
 
     if (serial_idx >= 0 &&
         (fds[serial_idx].revents & (POLLERR | POLLHUP | POLLNVAL))) {
-      recover_serial(&st, now);
-      continue;
+      return exit_bridge(&st);
     }
 
     if (client_idx >= 0 &&
@@ -524,31 +542,20 @@ static void bridge(const char *serial_path, int listen_fd) {
 
     if (serial_idx >= 0 && (fds[serial_idx].revents & POLLIN)) {
       int rc = drain_fd(&st, st.serial_fd, false, now);
-      if (rc < 0) {
-        recover_serial(&st, now);
-        continue;
-      }
-      if (rc > 0) {
-        recover_serial(&st, now);
-        continue;
-      }
+      if (rc < 0 || rc > 0)
+        return exit_bridge(&st);
     }
 
     if (client_idx >= 0 && (fds[client_idx].revents & POLLIN)) {
       int rc = drain_fd(&st, st.client_fd, true, now);
-      if (rc < 0) {
-        close_client(&st);
-        continue;
-      }
-      if (rc > 0) {
+      if (rc < 0 || rc > 0) {
         close_client(&st);
         continue;
       }
     }
   }
 
-  close_client(&st);
-  close_serial(&st);
+  return exit_bridge(&st);
 }
 
 int main(int argc, char **argv) {
@@ -589,10 +596,10 @@ int main(int argc, char **argv) {
   if (listen_fd < 0)
     return EXIT_FAILURE;
 
-  bridge(serial_path, listen_fd);
+  int failed = bridge(serial_path, listen_fd);
 
   close(listen_fd);
   unlink(socket_path);
 
-  return EXIT_SUCCESS;
+  return failed ? EXIT_FAILURE : EXIT_SUCCESS;
 }

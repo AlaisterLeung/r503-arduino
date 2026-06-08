@@ -17,7 +17,13 @@ Upload `r503_bridge.ino` to your Arduino board.
 
 ### Bridge daemon and libfprint-tod driver
 
-> Note: I've tried to adopt an approach that doesn't require a daemon or Unix socket. Unfortunately, since my Arduino Nano board **resets on every serial connection and disconnection** ([Arduino docs](https://support.arduino.cc/hc/en-us/articles/4839084114460-If-your-board-runs-the-sketch-twice)), every operation adds a significant (~3-second) delay for waiting it to finish booting and be in READY state which is impractical for daily usage. The daemon is a software fix which keeps the serial connection open. **Beware that my driver assumes the daemon is installed and running.** Thus, even though your board doesn't have the reset issue, you still need to install the daemon in order to use my driver. You can of course write one yourself that doesn't depend on a daemon.
+> Note: I've tried to adopt an approach that doesn't require a daemon or Unix socket. Unfortunately, since my Arduino Nano board **resets on every serial connection and disconnection** ([Arduino docs](https://support.arduino.cc/hc/en-us/articles/4839084114460-If-your-board-runs-the-sketch-twice)), every operation adds a significant (~3-second) delay for waiting it to finish booting and be in READY state which is impractical for daily usage. The daemon is a software fix which keeps the serial connection open.
+
+> Note 2: I've found a software fix for the above issue on Linux:
+> - `stty -F /dev/ttyUSB0 -hupcl` prevents the serial port from hanging up and resetting the Arduino.
+> - `tty.c_cflag &= ~HUPCL;` is also added to the daemon code in the latest commit.
+>
+> I'll later test if a daemon is still necessary after this change.
 
 If you are on Arch-based distro, install `libfprint-tod` from [AUR](https://aur.archlinux.org/packages/libfprint-tod). Verify the installation afterwards:
 

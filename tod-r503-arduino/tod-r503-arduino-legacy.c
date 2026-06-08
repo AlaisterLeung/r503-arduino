@@ -4,18 +4,12 @@
 #include "fpi-device.h"
 #include "fpi-print.h"
 
-#include <errno.h>
-#include <fcntl.h>
 #include <gio/gio.h>
-#include <gio/gunixinputstream.h>
-#include <gio/gunixoutputstream.h>
+#include <gio/gunixsocketaddress.h>
 #include <string.h>
-#include <termios.h>
-#include <unistd.h>
 
-#define R503_ARDUINO_SERIAL "/dev/ttyUSB0"
-#define SERIAL_FLUSH_TIMEOUT_MS 100
-#define OPEN_PING_TIMEOUT_MS 4000
+#define R503_ARDUINOD_SOCKET "/run/r503-arduinod.sock"
+#define SOCKET_FLUSH_TIMEOUT_MS 100
 
 typedef struct _FpiDeviceR503Arduino FpiDeviceR503Arduino;
 
@@ -36,7 +30,7 @@ static void r503_print_record_free(R503PrintRecord *rec) {
 struct _FpiDeviceR503Arduino {
   FpDevice parent;
 
-  gint serial_fd;
+  GSocketConnection *connection;
   GDataInputStream *input;
   GOutputStream *output;
 
@@ -56,9 +50,9 @@ G_DEFINE_TYPE(FpiDeviceR503Arduino, fpi_device_r503_arduino, FP_TYPE_DEVICE)
 #define FPI_IS_DEVICE_R503_ARDUINO(obj)                                        \
   (G_TYPE_CHECK_INSTANCE_TYPE((obj), FPI_TYPE_DEVICE_R503_ARDUINO))
 
-static const char *r503_get_serial_path(void) {
-  const char *env = g_getenv("R503_ARDUINO_SERIAL");
-  return env && env[0] != '\0' ? env : R503_ARDUINO_SERIAL;
+static const char *r503_get_socket_path(void) {
+  const char *env = g_getenv("R503_ARDUINO_SOCKET");
+  return env && env[0] != '\0' ? env : R503_ARDUINOD_SOCKET;
 }
 
 static GError *r503_make_error_proto(const char *msg) {
@@ -100,54 +94,9 @@ static void r503_trim_line(char *line) {
 static void r503_disconnect(FpiDeviceR503Arduino *self) {
   g_clear_object(&self->input);
   g_clear_object(&self->output);
-
-  if (self->serial_fd >= 0) {
-    close(self->serial_fd);
-    self->serial_fd = -1;
-  }
-
+  g_clear_object(&self->connection);
   if (self->prints)
     g_hash_table_remove_all(self->prints);
-}
-
-static gint r503_setup_serial(const char *path, GError **error) {
-  int fd = open(path, O_RDWR | O_NOCTTY | O_SYNC);
-  if (fd < 0) {
-    g_set_error(error, G_IO_ERROR, g_io_error_from_errno(errno),
-                "failed to open serial device %s: %s", path, g_strerror(errno));
-    return -1;
-  }
-
-  struct termios tty;
-  if (tcgetattr(fd, &tty) < 0) {
-    g_set_error(error, G_IO_ERROR, g_io_error_from_errno(errno),
-                "tcgetattr failed: %s", g_strerror(errno));
-    close(fd);
-    return -1;
-  }
-
-  cfmakeraw(&tty);
-  tty.c_cflag |= (CLOCAL | CREAD);
-  tty.c_cflag &= ~HUPCL;
-  tty.c_cc[VMIN] = 1;
-  tty.c_cc[VTIME] = 0;
-
-  if (cfsetspeed(&tty, B9600) < 0) {
-    g_set_error(error, G_IO_ERROR, g_io_error_from_errno(errno),
-                "cfsetspeed failed: %s", g_strerror(errno));
-    close(fd);
-    return -1;
-  }
-
-  if (tcsetattr(fd, TCSANOW, &tty) < 0) {
-    g_set_error(error, G_IO_ERROR, g_io_error_from_errno(errno),
-                "tcsetattr failed: %s", g_strerror(errno));
-    close(fd);
-    return -1;
-  }
-
-  tcflush(fd, TCIOFLUSH);
-  return fd;
 }
 
 typedef struct {
@@ -161,9 +110,7 @@ typedef struct {
 static void flush_data_free(FlushData *f) {
   if (f->timeout_id)
     g_source_remove(f->timeout_id);
-
   g_clear_object(&f->cancellable);
-  g_clear_object(&f->user_data);
   g_free(f);
 }
 
@@ -187,7 +134,6 @@ static void flush_read_cb(GObject *source_object, GAsyncResult *res,
 
   if (error || !line) {
     g_task_return_boolean(G_TASK(f->user_data), TRUE);
-    flush_data_free(f);
     return;
   }
 
@@ -207,7 +153,7 @@ static void r503_flush_async(FpiDeviceR503Arduino *self,
     g_cancellable_connect(f->cancellable, G_CALLBACK(g_cancellable_cancel),
                           g_object_ref(cancellable), g_object_unref);
   f->user_data = g_object_ref(task);
-  f->timeout_id = g_timeout_add(SERIAL_FLUSH_TIMEOUT_MS, flush_timeout_cb, f);
+  f->timeout_id = g_timeout_add(SOCKET_FLUSH_TIMEOUT_MS, flush_timeout_cb, f);
 
   if (!self->input) {
     g_task_return_boolean(task, TRUE);
@@ -306,7 +252,7 @@ static void read_line_cb(GObject *source_object, GAsyncResult *res,
     g_task_return_error(task, g_steal_pointer(&error));
   else if (!line)
     g_task_return_error(task,
-                        r503_make_error_proto("unexpected EOF from device"));
+                        r503_make_error_proto("unexpected EOF from daemon"));
   else {
     g_task_set_task_data(task, g_steal_pointer(&line), g_free);
     g_task_return_boolean(task, TRUE);
@@ -535,87 +481,39 @@ static FpPrint *r503_find_print_by_id(GPtrArray *prints, gint64 id) {
   return NULL;
 }
 
-typedef struct {
-  FpiDeviceR503Arduino *self;
-  GTask *task;
-  GCancellable *cancellable;
-  guint timeout_id;
-} OpenHandshake;
-
-static void open_handshake_free(OpenHandshake *h) {
-  if (h->timeout_id)
-    g_source_remove(h->timeout_id);
-
-  g_clear_object(&h->cancellable);
-  g_clear_object(&h->task);
-  g_free(h);
-}
-
-static gboolean open_handshake_timeout_cb(gpointer user_data) {
-  OpenHandshake *h = user_data;
-  h->timeout_id = 0;
-  g_cancellable_cancel(h->cancellable);
-  return G_SOURCE_REMOVE;
-}
-
-static void r503_open_handshake_cb(FpDevice *device, char *line, GError *error,
-                                   gpointer user_data) {
-  OpenHandshake *h = user_data;
-  if (error || !line || g_strcmp0(line, "OK") != 0) {
-    r503_disconnect(h->self);
-    g_task_return_error(h->task,
-                        error ? g_steal_pointer(&error)
-                              : r503_make_error_proto("device ping failed"));
-  } else {
-    g_task_return_boolean(h->task, TRUE);
-  }
-  open_handshake_free(h);
-}
-
 static void r503_open_cb(GObject *source, GAsyncResult *res,
                          gpointer user_data) {
   FpDevice *device = FP_DEVICE(user_data);
+  FpiDeviceR503Arduino *self = FPI_DEVICE_R503_ARDUINO(device);
+  GSocketClient *client = G_SOCKET_CLIENT(source);
   g_autoptr(GError) error = NULL;
 
-  if (!g_task_propagate_boolean(G_TASK(res), &error)) {
+  self->connection = g_socket_client_connect_finish(client, res, &error);
+  if (!self->connection) {
     fpi_device_open_complete(device, g_steal_pointer(&error));
     return;
   }
+
+  self->input = g_data_input_stream_new(
+      g_io_stream_get_input_stream(G_IO_STREAM(self->connection)));
+  g_data_input_stream_set_newline_type(self->input,
+                                       G_DATA_STREAM_NEWLINE_TYPE_LF);
+
+  self->output = g_object_ref(
+      g_io_stream_get_output_stream(G_IO_STREAM(self->connection)));
 
   fpi_device_open_complete(device, NULL);
 }
 
 static void r503_open(FpDevice *device) {
-  FpiDeviceR503Arduino *self = FPI_DEVICE_R503_ARDUINO(device);
-  const char *path = r503_get_serial_path();
-  g_autoptr(GError) error = NULL;
+  g_autoptr(GSocketClient) client = g_socket_client_new();
+  GSocketAddress *addr =
+      G_SOCKET_ADDRESS(g_unix_socket_address_new(r503_get_socket_path()));
 
-  gint fd = r503_setup_serial(path, &error);
-  if (fd < 0) {
-    fpi_device_open_complete(device, g_steal_pointer(&error));
-    return;
-  }
-
-  GInputStream *input_stream = g_unix_input_stream_new(fd, FALSE);
-  GOutputStream *output_stream = g_unix_output_stream_new(fd, FALSE);
-
-  self->serial_fd = fd;
-  self->input = g_data_input_stream_new(input_stream);
-  g_data_input_stream_set_newline_type(self->input,
-                                       G_DATA_STREAM_NEWLINE_TYPE_LF);
-  self->output = g_object_ref(output_stream);
-
-  g_object_unref(input_stream);
-  g_object_unref(output_stream);
-
-  OpenHandshake *h = g_new0(OpenHandshake, 1);
-  h->self = self;
-  h->task = g_task_new(device, NULL, r503_open_cb, device);
-  h->cancellable = g_cancellable_new();
-  h->timeout_id =
-      g_timeout_add(OPEN_PING_TIMEOUT_MS, open_handshake_timeout_cb, h);
-
-  r503_do_cmd_async(device, "PING", h->cancellable, r503_open_handshake_cb, h);
+  g_socket_client_connect_async(client, G_SOCKET_CONNECTABLE(addr),
+                                fpi_device_get_cancellable(device),
+                                r503_open_cb, device);
+  g_object_unref(addr);
 }
 
 static void r503_close(FpDevice *device) {
@@ -630,12 +528,11 @@ static void r503_probe(FpDevice *device) {
 
 typedef struct {
   FpDevice *device;
-} StepCtx;
+} EnrollCtx;
 
 static void enroll_step_cb(GObject *source, GAsyncResult *res,
                            gpointer user_data);
-
-static void enroll_step(StepCtx *ctx) {
+static void enroll_step(EnrollCtx *ctx) {
   r503_read_line_async(ctx->device, fpi_device_get_cancellable(ctx->device),
                        enroll_step_cb, ctx);
 }
@@ -644,7 +541,7 @@ static void enroll_step_cb(GObject *source, GAsyncResult *res,
                            gpointer user_data) {
   g_autofree char *line = NULL;
   g_autoptr(GError) error = NULL;
-  StepCtx *ctx = user_data;
+  EnrollCtx *ctx = user_data;
   FpDevice *device = ctx->device;
 
   line = r503_read_line_finish(device, res, &error);
@@ -713,7 +610,7 @@ static void r503_enroll_cmd_cb(FpDevice *device, char *line, GError *error,
   }
 
   if (g_str_has_prefix(line, "OK:PLACE_FINGER")) {
-    StepCtx *ctx = g_new0(StepCtx, 1);
+    EnrollCtx *ctx = g_new0(EnrollCtx, 1);
     ctx->device = device;
     fpi_device_report_finger_status_changes(device, FP_FINGER_STATUS_NEEDED,
                                             FP_FINGER_STATUS_NONE);
@@ -736,10 +633,13 @@ static void r503_enroll(FpDevice *device) {
                     r503_enroll_cmd_cb, device);
 }
 
+typedef struct {
+  FpDevice *device;
+} VerifyCtx;
+
 static void verify_step_cb(GObject *source, GAsyncResult *res,
                            gpointer user_data);
-
-static void verify_step(StepCtx *ctx) {
+static void verify_step(VerifyCtx *ctx) {
   r503_read_line_async(ctx->device, fpi_device_get_cancellable(ctx->device),
                        verify_step_cb, ctx);
 }
@@ -748,7 +648,7 @@ static void verify_step_cb(GObject *source, GAsyncResult *res,
                            gpointer user_data) {
   g_autofree char *line = NULL;
   g_autoptr(GError) error = NULL;
-  StepCtx *ctx = user_data;
+  VerifyCtx *ctx = user_data;
   FpDevice *device = ctx->device;
 
   line = r503_read_line_finish(device, res, &error);
@@ -803,7 +703,7 @@ static void verify_step_cb(GObject *source, GAsyncResult *res,
 static void r503_verify_cmd_cb(FpDevice *device, char *line, GError *error,
                                gpointer user_data) {
   (void)user_data;
-  StepCtx *ctx = g_new0(StepCtx, 1);
+  VerifyCtx *ctx = g_new0(VerifyCtx, 1);
   ctx->device = device;
 
   if (error || !line) {
@@ -842,7 +742,6 @@ typedef struct {
 
 static void identify_step_cb(GObject *source, GAsyncResult *res,
                              gpointer user_data);
-
 static void identify_step(IdentifyCtx *ctx) {
   r503_read_line_async(ctx->device, fpi_device_get_cancellable(ctx->device),
                        identify_step_cb, ctx);
@@ -1103,14 +1002,12 @@ fpi_device_r503_arduino_class_init(FpiDeviceR503ArduinoClass *klass) {
 }
 
 static void fpi_device_r503_arduino_init(FpiDeviceR503Arduino *self) {
-  self->serial_fd = -1;
   self->prints = g_hash_table_new_full(g_str_hash, g_str_equal, NULL,
                                        (GDestroyNotify)r503_print_record_free);
 }
 
 static void fpi_device_r503_arduino_finalize(GObject *object) {
   FpiDeviceR503Arduino *self = FPI_DEVICE_R503_ARDUINO(object);
-  r503_disconnect(self);
   g_clear_pointer(&self->prints, g_hash_table_destroy);
   G_OBJECT_CLASS(fpi_device_r503_arduino_parent_class)->finalize(object);
 }

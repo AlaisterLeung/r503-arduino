@@ -1,6 +1,6 @@
 # R503 Arduino Fingerprint Scanner
 
-The goal of this project is to create a DIY fingerprint scanner for Linux with `fprint` support. The role of the Arduino board is to bridge communications between the R503 scanner and the OS. This repository contains **an Arduino sketch**, **a bridge daemon**, and **a `libfprint-tod` virtual device driver**.
+The goal of this project is to create a DIY fingerprint scanner for Linux with `fprint` support. The role of the Arduino board is to bridge communications between the R503 scanner and the OS. This repository contains **an Arduino sketch**, **two `libfprint-tod` virtual device drivers** (one **daemon-less**, another one **daemon-based**), and also **a bridge daemon**.
 
 ## Hardware prerequisites
 
@@ -15,15 +15,11 @@ The goal of this project is to create a DIY fingerprint scanner for Linux with `
 
 Upload `r503_bridge.ino` to your Arduino board.
 
-### Bridge daemon and libfprint-tod driver
+### libfprint-tod driver (daemon-less)
 
-> Note: I've tried to adopt an approach that doesn't require a daemon or Unix socket. Unfortunately, since my Arduino Nano board **resets on every serial connection and disconnection** ([Arduino docs](https://support.arduino.cc/hc/en-us/articles/4839084114460-If-your-board-runs-the-sketch-twice)), every operation adds a significant (~3-second) delay for waiting it to finish booting and be in READY state which is impractical for daily usage. The daemon is a software fix which keeps the serial connection open.
-
-> Note 2: I've found a software fix for the above issue on Linux:
+> Note: A software fix can be applied on Linux to disable **DTR resets of Arduino boards**. Thus, a daemon is no longer necessary. See the legacy section below for details.
 > - `stty -F /dev/ttyUSB0 -hupcl` prevents the serial port from hanging up and resetting the Arduino.
-> - `tty.c_cflag &= ~HUPCL;` is also added to the daemon code in the latest commit.
->
-> I'll later test if a daemon is still necessary after this change.
+> - `tty.c_cflag &= ~HUPCL;` in the driver code does the same thing.
 
 If you are on Arch-based distro, install `libfprint-tod` from [AUR](https://aur.archlinux.org/packages/libfprint-tod). Verify the installation afterwards:
 
@@ -31,13 +27,12 @@ If you are on Arch-based distro, install `libfprint-tod` from [AUR](https://aur.
 pkg-config --modversion libfprint-2-tod-1
 ```
 
-Build and install the daemon and driver:
+Build and install the driver:
 
 ```bash
 meson setup build
 ninja -C build
 sudo ninja -C build install
-sudo systemctl enable --now r503-arduinod.service
 sudo systemctl restart fprintd
 ```
 
@@ -47,15 +42,36 @@ Verify the installation:
 fprintd-list $USER
 ```
 
-## Daemon & driver configuration
+#### Configuration for daemon-less driver
+
+- `R503_ARDUINO_SERIAL`: path to Arduino serial port (defaults to `/dev/ttyUSB0`)
+- `fprintd.service.d/r503-arduino.conf`: a systemd drop-in file which sets `R503_ARDUINO_DEVICE=1` and `DeviceAllow=/dev/ttyUSB0 rw`. Change device path if necessary.
+
+### [Legacy] Bridge daemon and libfprint-tod driver (daemon-based)
+
+*This section is kept for historical reference.*
+
+> Outdated note: I've tried to adopt an approach that doesn't require a daemon or Unix socket. Unfortunately, since my Arduino Nano board **resets on every serial connection and disconnection** ([Arduino docs](https://support.arduino.cc/hc/en-us/articles/4839084114460-If-your-board-runs-the-sketch-twice)), every operation adds a significant (~3-second) delay for waiting it to finish booting which is impractical for daily usage. The daemon is a software fix which keeps the serial connection open.
+
+Build and install the daemon and driver:
+
+```bash
+meson setup -Denable_daemon=true build-legacy
+ninja -C build-legacy
+sudo ninja -C build-legacy install
+sudo systemctl enable --now r503-arduinod.service
+sudo systemctl restart fprintd
+```
+
+#### Configuration for daemon-based driver
 
 - `R503_ARDUINOD_SERIAL`: path to Arduino serial port (defaults to `/dev/ttyUSB0`)
 - `R503_ARDUINOD_SOCKET`: path to the daemon's Unix socket (defaults to `/run/r503-arduinod.sock`)
-- A systemd drop-in is installed at `fprintd.service.d/r503-arduino.conf` which sets `R503_ARDUINO_DEVICE=1` and tells fprintd to use the virtual device.
+- A systemd drop-in is installed at `fprintd.service.d/r503-arduino-legacy.conf` which sets `R503_ARDUINO_DEVICE=1` and tells fprintd to use the virtual device.
 
 ## Usage
 
-### Arduino serial & daemon socket commands
+### Arduino serial commands
 
 | Command       | Output                                                                                                           | Description                                       |
 | ------------- | ---------------------------------------------------------------------------------------------------------------- | ------------------------------------------------- |
@@ -87,13 +103,6 @@ ls -la /dev/ttyUSB*
 sudo dmesg | grep ttyUSB
 ```
 
-### Debug daemon socket
-
-```bash
-sudo r503-arduinod
-socat - UNIX-CONNECT:/run/r503-arduinod.sock
-```
-
 ### Check driver detection
 
 ```bash
@@ -103,9 +112,20 @@ sudo G_MESSAGES_DEBUG=all /usr/lib/fprintd 2>&1 | grep -E "(r503_arduino|No driv
 
 ## Uninstall
 
+Daemon-less driver:
+
 ```bash
 sudo rm $(pkg-config --variable=tod_driversdir libfprint-2-tod-1)/libfprint-2-tod1-r503-arduino.so
 sudo rm $(pkg-config --variable=systemdsystemunitdir systemd)/fprintd.service.d/r503-arduino.conf
+sudo systemctl daemon-reload
+sudo systemctl restart fprintd
+```
+
+Legacy daemon-based driver:
+
+```bash
+sudo rm $(pkg-config --variable=tod_driversdir libfprint-2-tod-1)/libfprint-2-tod1-r503-arduino-legacy.so
+sudo rm $(pkg-config --variable=systemdsystemunitdir systemd)/fprintd.service.d/r503-arduino-legacy.conf
 
 sudo systemctl stop r503-arduinod
 sudo rm $(pkg-config --variable=systemdsystemunitdir systemd)/r503-arduinod.service

@@ -24,7 +24,6 @@
 
 #define IO_BUF_SIZE 4096
 #define CLIENT_READ_CHUNK 1024
-#define HEALTHCHECK_INITIAL_DELAY_MS 15000
 #define HEALTHCHECK_INTERVAL_MS 5000
 #define GENERIC_TIMEOUT_MS 1000
 #define ENROLL_TIMEOUT_MS 24000
@@ -233,7 +232,7 @@ static void close_serial(BridgeState *st) {
 
 static void reset_healthcheck(BridgeState *st, long long now) {
   st->healthcheck_pending = false;
-  st->next_healthcheck_ms = now + HEALTHCHECK_INITIAL_DELAY_MS;
+  st->next_healthcheck_ms = now + HEALTHCHECK_INTERVAL_MS;
   st->healthcheck_deadline_ms = 0;
 }
 

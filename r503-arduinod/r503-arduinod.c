@@ -26,8 +26,7 @@
 #define CLIENT_READ_CHUNK 1024
 #define HEALTHCHECK_INTERVAL_MS 5000
 #define GENERIC_TIMEOUT_MS 1000
-#define ENROLL_TIMEOUT_MS 24000
-#define VERIFY_TIMEOUT_MS 12000
+#define FINGER_TIMEOUT_MS 10000
 
 static volatile sig_atomic_t g_quit = 0;
 
@@ -254,18 +253,7 @@ static PendingCmd classify_command(const char *line) {
   return CMD_NONE;
 }
 
-static long long command_timeout_ms(PendingCmd cmd) {
-  switch (cmd) {
-  case CMD_ENROLL:
-    return ENROLL_TIMEOUT_MS;
-  case CMD_VERIFY:
-    return VERIFY_TIMEOUT_MS;
-  default:
-    return GENERIC_TIMEOUT_MS;
-  }
-}
-
-static bool pending_cmd_is_terminal(PendingCmd cmd, const char *line) {
+static bool pending_cmd(PendingCmd cmd, const char *line) {
   if (strncmp(line, "ERR:", 4) == 0)
     return true;
 
@@ -277,8 +265,7 @@ static bool pending_cmd_is_terminal(PendingCmd cmd, const char *line) {
   case CMD_ENROLL:
     return strncmp(line, "OK:ENROLLED,", 12) == 0;
   case CMD_VERIFY:
-    return strncmp(line, "OK:VERIFIED,", 12) == 0 ||
-           strcmp(line, "ERR:NO_MATCH") == 0;
+    return strncmp(line, "OK:VERIFIED,", 12) == 0;
   case CMD_LIST:
     return strncmp(line, "OK:LIST", 7) == 0;
   case CMD_DELETE:
@@ -286,6 +273,18 @@ static bool pending_cmd_is_terminal(PendingCmd cmd, const char *line) {
   case CMD_CLEAR:
     return strcmp(line, "OK:CLEARED") == 0;
   case CMD_NONE:
+  default:
+    return false;
+  }
+}
+
+static bool is_intermediate_step(PendingCmd cmd, const char *line) {
+  switch (cmd) {
+  case CMD_ENROLL:
+    return strncmp(line, "OK:PLACE_FINGER,", 16) == 0 ||
+           strcmp(line, "OK:REMOVE_FINGER") == 0;
+  case CMD_VERIFY:
+    return strcmp(line, "OK:PLACE_FINGER") == 0;
   default:
     return false;
   }
@@ -308,7 +307,7 @@ static int process_client_line(BridgeState *st, const char *raw, size_t raw_len,
   PendingCmd cmd = classify_command(line);
   if (cmd != CMD_NONE) {
     st->pending_cmd = cmd;
-    st->command_deadline_ms = now + command_timeout_ms(cmd);
+    st->command_deadline_ms = now + GENERIC_TIMEOUT_MS;
   }
 
   if (write_all(st->serial_fd, raw, raw_len) < 0) {
@@ -345,10 +344,12 @@ static int process_serial_line(BridgeState *st, const char *raw, size_t raw_len,
       return -1;
   }
 
-  if (st->pending_cmd != CMD_NONE &&
-      pending_cmd_is_terminal(st->pending_cmd, line)) {
+  if (st->pending_cmd != CMD_NONE && pending_cmd(st->pending_cmd, line)) {
     st->pending_cmd = CMD_NONE;
     st->command_deadline_ms = 0;
+  } else if (st->pending_cmd != CMD_NONE &&
+             is_intermediate_step(st->pending_cmd, line)) {
+    st->command_deadline_ms = now + FINGER_TIMEOUT_MS + GENERIC_TIMEOUT_MS;
   }
 
   return 0;
